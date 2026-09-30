@@ -1,0 +1,277 @@
+name: Build and Publish
+
+on:
+  schedule:
+  # 每日 UTC 02:23（北京时间 10:23），避开整点
+  - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 忽略版本判断，强制重新构建
+        type: boolean
+        default: false
+  push:
+    branches: [ main ]
+    paths-ignore:
+    - '**.md'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: openresty
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      resty_version: ${{ steps.check.outputs.resty_version }}
+      module_hash: ${{ steps.check.outputs.module_hash }}
+      module_count: ${{ steps.check.outputs.module_count }}
+      modules_present: ${{ steps.check.outputs.modules_present }}
+      mod_tag: ${{ steps.check.outputs.mod_tag }}
+      module_list: ${{ steps.check.outputs.module_list }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: 检查上游版本
+      id: check
+      env:
+        FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || 'false' }}
+        IMAGE_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
+        IMAGE_NAME: ${{ env.IMAGE_NAME }}
+      run: bash scripts/check-upstream.sh
+
+    - name: 写入任务摘要
+      run: |
+        {
+          echo "| 项 | 值 |"
+          echo "|---|---|"
+          echo "| 上游 tag | \`${{ steps.check.outputs.upstream_tag }}\` |"
+          echo "| OpenResty | \`${{ steps.check.outputs.resty_version }}\` |"
+          echo "| Ubuntu | \`${{ steps.check.outputs.ubuntu_codename }}\` |"
+          echo "| 模块数 | ${{ steps.check.outputs.module_count }} |"
+          echo "| 模块指纹 | \`${{ steps.check.outputs.module_hash }}\` |"
+          echo "| 是否构建 | **${{ steps.check.outputs.should_build }}** |"
+          echo "| 原因 | ${{ steps.check.outputs.reason }} |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+  # 模块清单为空时本 job 仍会运行（几步空操作），否则下游 push 会被连带跳过
+  build-modules:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: amd64
+          runner: ubuntu-latest
+        # 原生 ARM runner，避免 QEMU 模拟编译
+        - arch: arm64
+          runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - run: python3 scripts/modules.py prepare --ctx build/ctx
+
+    - uses: docker/setup-buildx-action@v4
+
+    - name: 下载 OpenResty 源码
+      env:
+        RESTY_VERSION: ${{ needs.check.outputs.resty_version }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        dirs=(build/ctx/modules/*/)
+        for dir in "${dirs[@]}"; do
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://openresty.org/download/openresty-${RESTY_VERSION}.tar.gz" \
+            -o "${dir}tmp/openresty-${RESTY_VERSION}.tar.gz"
+        done
+
+    - name: 编译模块
+      env:
+        PANEL_OPENRESTY_VERSION: ${{ needs.check.outputs.upstream_tag }}
+        RESTY_VERSION: ${{ needs.check.outputs.resty_version }}
+      run: |
+        set -euo pipefail
+        if [ ! -s build/ctx/module-dirs.txt ]; then
+          echo "模块清单为空，跳过编译"
+          exit 0
+        fi
+        while IFS=$'\t' read -r dir name; do
+          echo "::group::编译 ${name}"
+          docker buildx build \
+            --file docker/Dockerfile.modules \
+            --target module-export \
+            --platform "linux/${{ matrix.arch }}" \
+            --build-arg "PANEL_OPENRESTY_VERSION=${PANEL_OPENRESTY_VERSION}" \
+            --build-arg "RESTY_VERSION=${RESTY_VERSION}" \
+            --build-arg "RESTY_ADD_PACKAGE_BUILDDEPS=$(cat "build/ctx/modules/${dir}/packages.txt")" \
+            --cache-from "type=gha,scope=modules-${{ matrix.arch }}-${dir}" \
+            --cache-to "type=gha,mode=max,scope=modules-${{ matrix.arch }}-${dir}" \
+            --output "type=local,dest=build/compiled/${dir}" \
+            "build/ctx/modules/${dir}"
+          echo "::endgroup::"
+        done < build/ctx/module-dirs.txt
+
+    - run: python3 scripts/modules.py loadconf --out build/image --compiled build/compiled
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: image-${{ matrix.arch }}
+        path: build/image
+        retention-days: 7
+        if-no-files-found: error
+
+  push:
+    needs: [ check, build-modules ]
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: amd64
+          runner: ubuntu-latest
+        - arch: arm64
+          runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: actions/download-artifact@v8
+      with:
+        name: image-${{ matrix.arch }}
+        path: build/image
+
+    # 无自定义模块时目录不存在，COPY 会失败
+    - run: mkdir -p build/image/modules build/image/modules-enabled build/image/http.d
+
+    - uses: docker/setup-buildx-action@v4
+
+    - uses: docker/login-action@v4
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - uses: docker/build-push-action@v7
+      with:
+        context: build/image
+        file: docker/Dockerfile
+        platforms: linux/${{ matrix.arch }}
+        push: true
+        provenance: false
+        sbom: false
+        build-args: |
+          PANEL_OPENRESTY_VERSION=${{ needs.check.outputs.upstream_tag }}
+          MODULES_PRESENT=${{ needs.check.outputs.modules_present == 'true' && '1' || '0' }}
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.upstream_tag }}-${{ matrix.arch }}
+        cache-from: type=gha,scope=image-${{ matrix.arch }}
+        cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+
+  manifest:
+    needs: [ check, push ]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: docker/setup-buildx-action@v4
+
+    - uses: docker/login-action@v4
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: 合并多架构 manifest
+      env:
+        IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+        TAG: ${{ needs.check.outputs.upstream_tag }}
+        MODULE_COUNT: ${{ needs.check.outputs.module_count }}
+      run: |
+        set -euo pipefail
+        ARGS=(--tag "${IMAGE}:${TAG}" --tag "${IMAGE}:latest")
+        # 模块集非空时额外打一个带指纹的不可变 tag，便于回滚
+        if [ "${MODULE_COUNT}" != "0" ]; then
+          ARGS+=(--tag "${IMAGE}:${{ needs.check.outputs.mod_tag }}")
+        fi
+        docker buildx imagetools create "${ARGS[@]}" \
+          "${IMAGE}:${TAG}-amd64" "${IMAGE}:${TAG}-arm64"
+
+    - name: 冒烟测试
+      env:
+        IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+        TAG: ${{ needs.check.outputs.upstream_tag }}
+        MODULE_COUNT: ${{ needs.check.outputs.module_count }}
+        NGINX: /usr/local/openresty/nginx/sbin/nginx
+      run: |
+        set -euo pipefail
+        docker pull --platform linux/amd64 "${IMAGE}:${TAG}"
+
+        docker run --rm --platform linux/amd64 --entrypoint "$NGINX" "${IMAGE}:${TAG}" -V 2>&1 | tee /tmp/nginx-v.txt
+        grep -q -- '--with-compat' /tmp/nginx-v.txt \
+          || { echo "::error::镜像缺少 --with-compat，动态模块无法加载"; exit 1; }
+
+        # nginx -t 会真实加载模块，路径错误或 ABI 不兼容都会在这里暴露
+        docker run --rm --platform linux/amd64 --entrypoint "$NGINX" "${IMAGE}:${TAG}" -t
+
+        if [ "${MODULE_COUNT}" != "0" ]; then
+          docker run --rm --platform linux/amd64 --entrypoint "$NGINX" "${IMAGE}:${TAG}" -T 2>&1 \
+            | grep -E '^load_module' | tee /tmp/load-modules.txt
+          [ -s /tmp/load-modules.txt ] \
+            || { echo "::error::没有生成任何 load_module 指令"; exit 1; }
+          while read -r so; do
+            docker run --rm --platform linux/amd64 --entrypoint sh "${IMAGE}:${TAG}" -c "test -f '$so'" \
+              || { echo "::error::镜像内缺少 $so"; exit 1; }
+          done < <(sed -E 's/^load_module[[:space:]]+//; s/;$//' /tmp/load-modules.txt)
+        fi
+
+  release:
+    needs: [ check, build-modules ]
+    if: needs.check.outputs.should_build == 'true' && needs.check.outputs.modules_present == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: image-*
+        path: artifacts
+
+    - name: 打包制品
+      env:
+        TAG: ${{ needs.check.outputs.upstream_tag }}
+      run: |
+        set -euo pipefail
+        mkdir -p pkg
+        cp -r artifacts/image-amd64/modules pkg/amd64
+        cp -r artifacts/image-arm64/modules pkg/arm64
+        cp -r artifacts/image-amd64/modules-enabled pkg/modules-enabled
+        if [ -n "$(ls -A artifacts/image-amd64/http.d 2>/dev/null)" ]; then
+          cp -r artifacts/image-amd64/http.d pkg/http.d
+        fi
+        sed "s/@TAG@/${TAG}/g" docker/RELEASE-README.txt > pkg/README.txt
+        tar -czf "1panel-openresty-${TAG}-modules.tar.gz" -C pkg .
+
+    - uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ needs.check.outputs.upstream_tag }}
+        name: ${{ needs.check.outputs.upstream_tag }}
+        files: 1panel-openresty-${{ needs.check.outputs.upstream_tag }}-modules.tar.gz
+        body: |
+          基于 `1panel/openresty:${{ needs.check.outputs.upstream_tag }}` 构建，预编译了以下动态模块：
+
+          | 模块 | 加载顺序 |
+          |---|---|
+          ${{ needs.check.outputs.module_list }}
+
+          模块清单指纹：`${{ needs.check.outputs.module_hash }}`
+
+          - 镜像：`${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.upstream_tag }}`
+          - 制品包用法见包内 `README.txt`
+        fail_on_unmatched_files: true

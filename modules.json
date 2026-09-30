@@ -1,0 +1,35 @@
+{
+  "modules": [
+    {
+      "name": "ngx_brotli",
+      "source": {
+        "type": "image",
+        "dir": "/usr/local/openresty/modules/ngx_brotli"
+      },
+      "packages": [],
+      "params": "--add-dynamic-module=/usr/local/openresty/modules/ngx_brotli",
+      "script": "cp -a /usr/local/openresty/modules/ngx_brotli/deps/brotli/out/libbrotli*.so* /usr/local/lib/",
+      "loadOrder": 10,
+      "httpLoadOrder": 100,
+      "httpConfig": [
+        "brotli on;",
+        "brotli_comp_level 5;",
+        "brotli_min_length 1k;",
+        "brotli_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;"
+      ]
+    },
+    {
+      "name": "geoip2",
+      "source": {
+        "type": "git",
+        "url": "https://github.com/leev/ngx_http_geoip2_module.git",
+        "ref": "3.4",
+        "dir": "/tmp/ngx_http_geoip2_module"
+      },
+      "packages": ["libmaxminddb-dev"],
+      "params": "--add-dynamic-module=/tmp/ngx_http_geoip2_module",
+      "script": "find /usr/lib -maxdepth 2 -name 'libmaxminddb*.so*' -exec cp -a {} /usr/local/lib/ \\;",
+      "loadOrder": 40
+    }
+  ]
+}

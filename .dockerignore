@@ -1,0 +1,7 @@
+# 最终镜像的构建上下文是 build/image/，本文件用于本地直接以仓库根为上下文时排除无关文件。
+.git
+.github
+build
+README.md
+LICENSE
+modules.json

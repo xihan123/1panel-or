@@ -1,0 +1,81 @@
+# 模块编译器。与 1Panel 的 apps/openresty/*/build/Dockerfile.modules 结构一致，差别是
+# RESTY_VERSION / PANEL_OPENRESTY_VERSION 由构建参数传入，模块源码准备脚本由
+# scripts/modules.py 生成后放进构建上下文的 tmp/。
+#
+# 产物契约（与 1Panel 运行时一致，不要改）：
+#   /out/*.so       模块本体
+#   /out/lib/*.so*  依赖库，靠 rpath 的 $ORIGIN/lib 解析
+
+ARG RESTY_IMAGE_BASE="ubuntu"
+ARG RESTY_IMAGE_TAG="noble"
+ARG PANEL_OPENRESTY_VERSION
+ARG RESTY_VERSION
+
+# 用于取出基础镜像里已内置的模块源码（ngx_brotli 及其已编译好的 brotli 依赖）
+FROM 1panel/openresty:${PANEL_OPENRESTY_VERSION} AS panel-openresty
+
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS module-builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG RESTY_VERSION
+ARG RESTY_J="1"
+ARG RESTY_ADD_PACKAGE_BUILDDEPS=""
+ARG CONTAINER_PACKAGE_URL=""
+
+RUN if [ -n "${CONTAINER_PACKAGE_URL}" ]; then \
+      if [ -f /etc/apt/sources.list ]; then \
+        sed -i "s|http://archive.ubuntu.com/ubuntu/|${CONTAINER_PACKAGE_URL}|g" /etc/apt/sources.list \
+        && sed -i "s|http://security.ubuntu.com/ubuntu/|${CONTAINER_PACKAGE_URL}|g" /etc/apt/sources.list; \
+      fi; \
+      if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+        sed -i "s|http://archive.ubuntu.com/ubuntu/|${CONTAINER_PACKAGE_URL}|g" /etc/apt/sources.list.d/ubuntu.sources \
+        && sed -i "s|http://security.ubuntu.com/ubuntu/|${CONTAINER_PACKAGE_URL}|g" /etc/apt/sources.list.d/ubuntu.sources; \
+      fi; \
+    fi
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libgd-dev libgeoip-dev libpcre2-dev \
+        libreadline-dev libssl-dev libxslt1-dev make patchelf perl unzip wget zlib1g-dev \
+        ${RESTY_ADD_PACKAGE_BUILDDEPS} \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tmp /tmp
+
+# 基础镜像里已内置 ngx_brotli 源码，且 deps/brotli 已预编译成 .so
+COPY --from=panel-openresty /usr/local/openresty/modules/ngx_brotli /usr/local/openresty/modules/ngx_brotli
+
+RUN bash /tmp/module-pre.sh \
+    && cd /tmp \
+    && tar xzf openresty-${RESTY_VERSION}.tar.gz \
+    && cd /tmp/openresty-${RESTY_VERSION} \
+    && mapfile -t MODULE_CONFIG < /tmp/module-config.args \
+    && ./configure -j${RESTY_J} \
+         --with-compat \
+         --with-http_ssl_module \
+         --with-stream \
+         --with-stream_ssl_module \
+         --with-http_realip_module \
+         --with-http_dav_module \
+         "${MODULE_CONFIG[@]}" \
+    && NGINX_BUILD_DIR="$(find build -mindepth 1 -maxdepth 1 -type d -name 'nginx-*' | head -n 1)" \
+    && test -n "${NGINX_BUILD_DIR}" \
+    && make -C "${NGINX_BUILD_DIR}" -j${RESTY_J} modules \
+    && mkdir -p /out/lib \
+    && find "${NGINX_BUILD_DIR}/objs" -maxdepth 1 -type f -name '*.so' -exec cp -a {} /out/ \; \
+    && test -n "$(find /out -maxdepth 1 -type f -name '*.so' -print -quit)" \
+    && if find /usr/local/lib -maxdepth 1 -name '*.so*' -print -quit 2>/dev/null | grep -q .; then \
+         find /usr/local/lib -maxdepth 1 -name '*.so*' -exec cp -a {} /out/lib/ \; ; \
+       fi \
+    && find /out -maxdepth 1 -type f -name '*.so' \
+         -exec patchelf --set-rpath '$ORIGIN/lib:/usr/local/openresty/1pwaf/libraries' {} \;
+
+FROM ${RESTY_IMAGE_BASE}:${RESTY_IMAGE_TAG} AS module-output
+COPY --from=module-builder /out /out
+CMD ["/bin/true"]
+
+# 供 buildx --output type=local 导出 /out，避免连整个 ubuntu rootfs 一起导出。
+# 1Panel 用的是上面的 module-output + docker cp，产物一致。
+FROM scratch AS module-export
+COPY --from=module-builder /out /
