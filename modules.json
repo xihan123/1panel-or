@@ -6,9 +6,9 @@
         "type": "image",
         "dir": "/usr/local/openresty/modules/ngx_brotli"
       },
-      "packages": [],
+      "packages": ["libbrotli-dev"],
       "params": "--add-dynamic-module=/usr/local/openresty/modules/ngx_brotli",
-      "script": "cp -a /usr/local/openresty/modules/ngx_brotli/deps/brotli/out/libbrotli*.so* /usr/local/lib/",
+      "script": "find /usr/lib -maxdepth 2 -name 'libbrotli*.so*' -exec cp -a {} /usr/local/lib/ \\;",
       "loadOrder": 10,
       "httpLoadOrder": 100,
       "httpConfig": [

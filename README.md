@@ -108,7 +108,7 @@ docker run -d --name openresty -p 80:80 -p 443:443 \
 
 模块若依赖外部 `.so`，用 `script` 把它拷进 `/usr/local/lib`，Dockerfile 会把该目录下的库收进产物的 `lib/`，并给模块打上 `rpath=$ORIGIN/lib`，所以制品是自包含的
 
-`ngx_brotli` 用 `"type": "image"` 是因为它的源码连同已编译好的 brotli 依赖库都在基础镜像的 `/usr/local/openresty/modules/ngx_brotli` 下，直接复用即可，既不用联网 clone，也不受上游 `google/ngx_brotli`（master 停留在 2023 年）的影响
+`ngx_brotli` 用 `"type": "image"` 复用基础镜像 `/usr/local/openresty/modules/ngx_brotli` 下的源码，无需联网 clone。Brotli 依赖由 `libbrotli-dev` 提供，`script` 从系统库目录收集共享库，不依赖源码目录下存在预编译的 `.so`
 
 ## 工作流
 
